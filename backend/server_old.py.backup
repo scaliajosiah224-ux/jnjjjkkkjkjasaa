@@ -1,0 +1,1291 @@
+from fastapi import FastAPI, HTTPException, Depends, status, WebSocket, WebSocketDisconnect, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from contextlib import asynccontextmanager
+from motor.motor_asyncio import AsyncIOMotorClient
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from pydantic import BaseModel, EmailStr, Field
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta, timezone
+import os
+import uuid
+import httpx
+import json
+import asyncio
+import base64
+import hmac
+import hashlib
+import time
+import secrets
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─────────────── Config ───────────────
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+JWT_SECRET = os.environ.get("JWT_SECRET", "ringring_secret_2025")
+JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+JWT_EXP_HOURS = int(os.environ.get("JWT_EXPIRATION_HOURS", "24"))
+
+SINCH_PROJECT_ID = os.environ.get("SINCH_PROJECT_ID", "")
+SINCH_ACCESS_KEY_ID = os.environ.get("SINCH_ACCESS_KEY_ID", "")
+SINCH_KEY_SECRET = os.environ.get("SINCH_KEY_SECRET", "")
+SINCH_SERVICE_PLAN_ID = os.environ.get("SINCH_SERVICE_PLAN_ID", "")
+SINCH_SMS_API_TOKEN = os.environ.get("SINCH_SMS_API_TOKEN", "")
+SINCH_APP_KEY = os.environ.get("SINCH_APP_KEY", "")
+SINCH_APP_SECRET = os.environ.get("SINCH_APP_SECRET", "")
+KLIPY_API_KEY = os.environ.get("KLIPY_API_KEY", "")
+
+# ─────────────── DB ───────────────
+db_client = None
+db = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_client, db
+    db_client = AsyncIOMotorClient(MONGO_URL)
+    db = db_client["ringring"]
+    # Ensure indexes
+    await db.users.create_index("email", unique=True)
+    await db.users.create_index("username", unique=True)
+    await db.messages.create_index([("conversation_id", 1), ("created_at", -1)])
+    await db.calls.create_index([("user_id", 1), ("created_at", -1)])
+    yield
+    db_client.close()
+
+app = FastAPI(title="RingRing API", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ─────────────── Auth Utils ───────────────
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+def create_token(user_id: str, email: str) -> str:
+    exp = datetime.utcnow() + timedelta(hours=JWT_EXP_HOURS)
+    return jwt.encode({"sub": user_id, "email": email, "exp": exp}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        payload = jwt.decode(creds.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = await db.users.find_one({"id": user_id})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+# ─────────────── Sinch Helpers ───────────────
+async def get_sinch_access_token() -> str:
+    """Get OAuth2 access token from Sinch using key ID and secret."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://auth.sinch.com/oauth2/token",
+                data={"grant_type": "client_credentials"},
+                auth=(SINCH_ACCESS_KEY_ID, SINCH_KEY_SECRET),
+                timeout=10.0
+            )
+            resp.raise_for_status()
+            return resp.json().get("access_token", "")
+    except Exception as e:
+        print(f"Sinch OAuth error: {e}")
+        return ""
+
+async def sinch_request(method: str, url: str, json_data: dict = None, use_token_auth: bool = True) -> dict:
+    """Make authenticated request to Sinch API."""
+    try:
+        if use_token_auth:
+            # Use API token directly (for SMS API)
+            headers = {
+                "Authorization": f"Bearer {SINCH_SMS_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+        else:
+            # Use OAuth2 access token (for Numbers API)
+            token = await get_sinch_access_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+        
+        async with httpx.AsyncClient() as client:
+            if method.upper() == "GET":
+                resp = await client.get(url, headers=headers, timeout=15.0)
+            elif method.upper() == "POST":
+                resp = await client.post(url, headers=headers, json=json_data, timeout=15.0)
+            elif method.upper() == "DELETE":
+                resp = await client.delete(url, headers=headers, timeout=15.0)
+            else:
+                resp = await client.request(method, url, headers=headers, json=json_data, timeout=15.0)
+            
+            if resp.status_code not in [200, 201]:
+                print(f"Sinch API error {resp.status_code}: {resp.text}")
+                return {"error": resp.text, "status_code": resp.status_code}
+            
+            return resp.json()
+    except Exception as e:
+        print(f"Sinch request error: {e}")
+        return {"error": str(e)}
+
+# ─────────────── Sinch Voice JWT Generator ───────────────
+class SinchVoiceJWTGenerator:
+    """Generate JWT tokens for Sinch Voice & Video SDK authentication"""
+    def __init__(self, app_key: str, app_secret: str):
+        self.app_key = app_key
+        self.app_secret = app_secret
+    
+    def _derive_signing_key(self, date_str: str) -> bytes:
+        """Derive signing key using HKDF"""
+        salt = f"SinchRTCSigningKey{date_str}".encode()
+        
+        # HKDF-Extract
+        hkdf_extract = hmac.new(
+            salt,
+            self.app_secret.encode(),
+            hashlib.sha256
+        ).digest()
+        
+        # HKDF-Expand
+        hkdf_expand = hmac.new(
+            hkdf_extract,
+            b"SinchRTCSigningKey",
+            hashlib.sha256
+        ).digest()[:32]
+        
+        return hkdf_expand
+    
+    def generate_token(self, user_id: str, ttl_seconds: int = 3600) -> str:
+        """Generate a JWT token for Sinch authentication"""
+        now = int(time.time())
+        expiry = now + ttl_seconds
+        current_date = datetime.now(timezone.utc).strftime("%Y%m%d")
+        
+        header = {
+            "alg": "HS256",
+            "kid": f"hkdfv1-{current_date}"
+        }
+        
+        payload = {
+            "iss": f"//rtc.sinch.com/applications/{self.app_key}",
+            "sub": f"//rtc.sinch.com/applications/{self.app_key}/users/{user_id}",
+            "iat": now,
+            "exp": expiry,
+            "nonce": secrets.token_hex(16)
+        }
+        
+        signing_key = self._derive_signing_key(current_date)
+        
+        # Encode header and payload
+        header_encoded = base64.urlsafe_b64encode(
+            json.dumps(header, separators=(',', ':')).encode()
+        ).decode().rstrip('=')
+        
+        payload_encoded = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(',', ':')).encode()
+        ).decode().rstrip('=')
+        
+        # Create signature
+        message = f"{header_encoded}.{payload_encoded}"
+        signature = base64.urlsafe_b64encode(
+            hmac.new(signing_key, message.encode(), hashlib.sha256).digest()
+        ).decode().rstrip('=')
+        
+        return f"{message}.{signature}"
+
+# Initialize Sinch Voice JWT generator
+sinch_voice_jwt = SinchVoiceJWTGenerator(SINCH_APP_KEY, SINCH_APP_SECRET)
+
+# ─────────────── WebSocket Manager ───────────────
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, user_id: str):
+        await websocket.accept()
+        if user_id not in self.active_connections:
+            self.active_connections[user_id] = []
+        self.active_connections[user_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, user_id: str):
+        if user_id in self.active_connections:
+            self.active_connections[user_id].remove(websocket)
+
+    async def send_to_user(self, user_id: str, message: dict):
+        if user_id in self.active_connections:
+            for ws in self.active_connections[user_id]:
+                try:
+                    await ws.send_json(message)
+                except:
+                    pass
+
+    async def broadcast(self, message: dict):
+        for conns in self.active_connections.values():
+            for ws in conns:
+                try:
+                    await ws.send_json(message)
+                except:
+                    pass
+
+manager = ConnectionManager()
+
+# ─────────────── Pydantic Models ───────────────
+class RegisterRequest(BaseModel):
+    email: str
+    username: str
+    password: str
+    display_name: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class SendSMSRequest(BaseModel):
+    to_number: str
+    message: str
+    from_number: Optional[str] = None
+    media_url: Optional[str] = None
+    media_type: Optional[str] = None  # image, gif, audio, video
+
+class ReactToMessageRequest(BaseModel):
+    message_id: str
+    emoji: str
+
+class ReadReceiptRequest(BaseModel):
+    conversation_id: str
+    message_id: Optional[str] = None
+
+class ConversationRequest(BaseModel):
+    recipient_number: str
+    recipient_name: Optional[str] = None
+
+class SearchNumbersRequest(BaseModel):
+    country_code: str = "US"
+    number_type: str = "LOCAL"
+    area_code: Optional[str] = None
+
+class PurchaseNumberRequest(BaseModel):
+    phone_number: str
+
+class AddContactRequest(BaseModel):
+    name: str
+    phone_number: str
+    email: Optional[str] = None
+    notes: Optional[str] = None
+
+class UpdateProfileRequest(BaseModel):
+    display_name: Optional[str] = None
+    avatar_color: Optional[str] = None
+
+# ─────────────── AUTH ROUTES ───────────────
+@app.post("/api/auth/register")
+async def register(req: RegisterRequest):
+    existing = await db.users.find_one({"$or": [{"email": req.email}, {"username": req.username}]})
+    if existing:
+        raise HTTPException(status_code=400, detail="Email or username already exists")
+    
+    user_id = str(uuid.uuid4())
+    user = {
+        "id": user_id,
+        "email": req.email,
+        "username": req.username,
+        "display_name": req.display_name or req.username,
+        "password_hash": hash_password(req.password),
+        "phone_numbers": [],
+        "avatar_color": "#8B5CF6",
+        "created_at": datetime.utcnow().isoformat(),
+        "plan": "free",
+        "credits": 0.0
+    }
+    await db.users.insert_one(user)
+    
+    token = create_token(user_id, req.email)
+    return {
+        "token": token,
+        "user": {
+            "id": user_id,
+            "email": user["email"],
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "phone_numbers": [],
+            "avatar_color": user["avatar_color"],
+            "plan": "free",
+            "credits": 0.0
+        }
+    }
+
+@app.post("/api/auth/login")
+async def login(req: LoginRequest):
+    user = await db.users.find_one({"email": req.email})
+    if not user or not verify_password(req.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    token = create_token(user["id"], user["email"])
+    return {
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "username": user["username"],
+            "display_name": user.get("display_name", user["username"]),
+            "phone_numbers": user.get("phone_numbers", []),
+            "avatar_color": user.get("avatar_color", "#8B5CF6"),
+            "plan": user.get("plan", "free"),
+            "credits": user.get("credits", 0.0)
+        }
+    }
+
+@app.get("/api/auth/me")
+async def get_me(user=Depends(get_current_user)):
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "username": user["username"],
+        "display_name": user.get("display_name", user["username"]),
+        "phone_numbers": user.get("phone_numbers", []),
+        "avatar_color": user.get("avatar_color", "#8B5CF6"),
+        "plan": user.get("plan", "free"),
+        "credits": user.get("credits", 0.0)
+    }
+
+@app.put("/api/auth/profile")
+async def update_profile(req: UpdateProfileRequest, user=Depends(get_current_user)):
+    update_data = {}
+    if req.display_name:
+        update_data["display_name"] = req.display_name
+    if req.avatar_color:
+        update_data["avatar_color"] = req.avatar_color
+    
+    await db.users.update_one({"id": user["id"]}, {"$set": update_data})
+    updated = await db.users.find_one({"id": user["id"]})
+    return {
+        "id": updated["id"],
+        "email": updated["email"],
+        "username": updated["username"],
+        "display_name": updated.get("display_name", updated["username"]),
+        "phone_numbers": updated.get("phone_numbers", []),
+        "avatar_color": updated.get("avatar_color", "#8B5CF6")
+    }
+
+# ─────────────── PHONE NUMBERS ROUTES ───────────────
+@app.get("/api/numbers/sinch-active")
+async def get_sinch_active_numbers(user=Depends(get_current_user)):
+    """Get active numbers from Sinch account."""
+    try:
+        token = await get_sinch_access_token()
+        if not token:
+            return {"numbers": []}
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                f"https://numbers.api.sinch.com/v1/projects/{SINCH_PROJECT_ID}/activeNumbers",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return {"numbers": data.get("activeNumbers", [])}
+            return {"numbers": []}
+    except Exception as e:
+        return {"numbers": [], "error": str(e)}
+
+@app.post("/api/numbers/search")
+async def search_numbers(req: SearchNumbersRequest, user=Depends(get_current_user)):
+    """Search for available phone numbers via Sinch Numbers API."""
+    try:
+        token = await get_sinch_access_token()
+        if not token:
+            return {"available_numbers": [], "message": "Sinch auth failed - check credentials"}
+        
+        # Try the GET endpoint for available numbers
+        params = {
+            "regionCode": req.country_code,
+            "type": req.number_type,
+            "size": 20
+        }
+        
+        if req.area_code:
+            params["numberPattern.pattern"] = f"+1{req.area_code}"
+            params["numberPattern.searchPattern"] = "START"
+        
+        async with httpx.AsyncClient() as client:
+            # Try GET approach first
+            resp = await client.get(
+                f"https://numbers.api.sinch.com/v1/projects/{SINCH_PROJECT_ID}/availableNumbers",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+                timeout=15.0
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                numbers = []
+                for num in data.get("availableNumbers", []):
+                    numbers.append({
+                        "phone_number": num.get("phoneNumber"),
+                        "country_code": num.get("regionCode"),
+                        "type": num.get("type"),
+                        "capabilities": num.get("capability", []),
+                        "monthly_cost": num.get("money", {}).get("amount", "1.00"),
+                        "currency": num.get("money", {}).get("currencyCode", "USD")
+                    })
+                return {"available_numbers": numbers}
+            else:
+                # If search fails (e.g. trial account), show existing Sinch numbers
+                active_resp = await client.get(
+                    f"https://numbers.api.sinch.com/v1/projects/{SINCH_PROJECT_ID}/activeNumbers",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0
+                )
+                if active_resp.status_code == 200:
+                    active_data = active_resp.json()
+                    already_owned = await db.phone_numbers.distinct("phone_number", {"user_id": user["id"]})
+                    numbers = []
+                    for num in active_data.get("activeNumbers", []):
+                        if num.get("phoneNumber") not in already_owned:
+                            numbers.append({
+                                "phone_number": num.get("phoneNumber"),
+                                "country_code": num.get("regionCode"),
+                                "type": num.get("type"),
+                                "capabilities": num.get("capability", []),
+                                "monthly_cost": num.get("money", {}).get("amount", "1.00"),
+                                "currency": num.get("money", {}).get("currencyCode", "USD"),
+                                "note": "Your Sinch active number"
+                            })
+                    if numbers:
+                        return {"available_numbers": numbers, "note": "Showing your Sinch active numbers"}
+                    
+                return {"available_numbers": [], "error": f"Search not available: {resp.text}", "note": "Your Sinch account may be on trial. Contact Sinch to enable number search."}
+    except Exception as e:
+        return {"available_numbers": [], "error": str(e)}
+
+@app.post("/api/numbers/claim")
+async def claim_sinch_number(req: PurchaseNumberRequest, user=Depends(get_current_user)):
+    """Claim/sync an already-purchased Sinch number to user's account."""
+    existing = await db.phone_numbers.find_one({
+        "user_id": user["id"],
+        "phone_number": req.phone_number
+    })
+    if existing:
+        raise HTTPException(status_code=400, detail="You already have this number")
+    
+    # Verify the number exists in Sinch
+    token = await get_sinch_access_token()
+    if not token:
+        raise HTTPException(status_code=503, detail="Sinch auth failed")
+    
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://numbers.api.sinch.com/v1/projects/{SINCH_PROJECT_ID}/activeNumbers",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0
+        )
+    
+    sinch_number = None
+    if resp.status_code == 200:
+        data = resp.json()
+        for n in data.get("activeNumbers", []):
+            if n.get("phoneNumber") == req.phone_number:
+                sinch_number = n
+                break
+    
+    if not sinch_number:
+        raise HTTPException(status_code=404, detail="Number not found in your Sinch account")
+    
+    # Add to DB
+    number_id = str(uuid.uuid4())
+    number_doc = {
+        "id": number_id,
+        "user_id": user["id"],
+        "phone_number": req.phone_number,
+        "country_code": sinch_number.get("regionCode", "US"),
+        "type": sinch_number.get("type", "LOCAL"),
+        "capabilities": sinch_number.get("capability", ["SMS", "VOICE"]),
+        "sinch_number_id": sinch_number.get("phoneNumber", req.phone_number),
+        "purchased_at": datetime.utcnow().isoformat(),
+        "is_active": True
+    }
+    await db.phone_numbers.insert_one(number_doc)
+    
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$addToSet": {"phone_numbers": req.phone_number}}
+    )
+    
+    return {
+        "success": True,
+        "phone_number": req.phone_number,
+        "message": f"Successfully claimed {req.phone_number}"
+    }
+
+@app.post("/api/numbers/purchase")
+async def purchase_number(req: PurchaseNumberRequest, user=Depends(get_current_user)):
+    """Purchase/rent a phone number from Sinch."""
+    try:
+        # Check if user already has this number
+        existing = await db.phone_numbers.find_one({
+            "user_id": user["id"],
+            "phone_number": req.phone_number
+        })
+        if existing:
+            raise HTTPException(status_code=400, detail="You already own this number")
+        
+        token = await get_sinch_access_token()
+        if not token:
+            raise HTTPException(status_code=503, detail="Sinch authentication failed")
+        
+        # Rent the number
+        url = f"https://numbers.api.sinch.com/v1/projects/{SINCH_PROJECT_ID}/availableNumbers/{req.phone_number}:rent"
+        
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "smsConfiguration": {
+                        "servicePlanId": SINCH_SERVICE_PLAN_ID
+                    }
+                },
+                timeout=15.0
+            )
+            
+            if resp.status_code not in [200, 201]:
+                raise HTTPException(status_code=resp.status_code, detail=f"Purchase failed: {resp.text}")
+            
+            data = resp.json()
+        
+        # Save to DB
+        number_id = str(uuid.uuid4())
+        number_doc = {
+            "id": number_id,
+            "user_id": user["id"],
+            "phone_number": req.phone_number,
+            "country_code": data.get("regionCode", "US"),
+            "type": data.get("type", "LOCAL"),
+            "capabilities": data.get("capability", ["SMS", "VOICE"]),
+            "sinch_number_id": data.get("id", req.phone_number),
+            "purchased_at": datetime.utcnow().isoformat(),
+            "is_active": True
+        }
+        await db.phone_numbers.insert_one(number_doc)
+        
+        # Update user's phone_numbers list
+        await db.users.update_one(
+            {"id": user["id"]},
+            {"$push": {"phone_numbers": req.phone_number}}
+        )
+        
+        return {
+            "success": True,
+            "phone_number": req.phone_number,
+            "message": f"Successfully purchased {req.phone_number}"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/numbers/my")
+async def get_my_numbers(user=Depends(get_current_user)):
+    """Get user's purchased phone numbers."""
+    numbers = await db.phone_numbers.find(
+        {"user_id": user["id"], "is_active": True},
+        {"_id": 0}
+    ).to_list(100)
+    return {"numbers": numbers}
+
+@app.delete("/api/numbers/{number_id}")
+async def release_number(number_id: str, user=Depends(get_current_user)):
+    """Release a phone number."""
+    number = await db.phone_numbers.find_one({"id": number_id, "user_id": user["id"]})
+    if not number:
+        raise HTTPException(status_code=404, detail="Number not found")
+    
+    try:
+        token = await get_sinch_access_token()
+        if token:
+            phone_num = number["phone_number"]
+            url = f"https://numbers.api.sinch.com/v1/projects/{SINCH_PROJECT_ID}/activeNumbers/{phone_num}"
+            async with httpx.AsyncClient() as client:
+                await client.delete(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0
+                )
+    except Exception as e:
+        print(f"Error releasing number from Sinch: {e}")
+    
+    await db.phone_numbers.update_one({"id": number_id}, {"$set": {"is_active": False}})
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$pull": {"phone_numbers": number["phone_number"]}}
+    )
+    return {"success": True, "message": "Number released"}
+
+# ─────────────── MESSAGES ROUTES ───────────────
+@app.get("/api/messages/conversations")
+async def get_conversations(user=Depends(get_current_user)):
+    """Get all conversations for the current user."""
+    conversations = await db.conversations.find(
+        {"participants": user["id"]},
+        {"_id": 0}
+    ).sort("updated_at", -1).to_list(100)
+    return {"conversations": conversations}
+
+@app.post("/api/messages/conversation")
+async def create_or_get_conversation(req: ConversationRequest, user=Depends(get_current_user)):
+    """Create or get existing conversation."""
+    # Check if conversation already exists
+    conv = await db.conversations.find_one({
+        "user_id": user["id"],
+        "recipient_number": req.recipient_number
+    })
+    
+    if not conv:
+        conv_id = str(uuid.uuid4())
+        conv = {
+            "id": conv_id,
+            "user_id": user["id"],
+            "participants": [user["id"]],
+            "recipient_number": req.recipient_number,
+            "recipient_name": req.recipient_name or req.recipient_number,
+            "last_message": None,
+            "unread_count": 0,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        await db.conversations.insert_one(conv)
+    
+    # Get messages for this conversation
+    messages = await db.messages.find(
+        {"conversation_id": conv["id"]},
+        {"_id": 0}
+    ).sort("created_at", 1).to_list(200)
+    
+    conv_data = {k: v for k, v in conv.items() if k != "_id"}
+    conv_data["messages"] = messages
+    return conv_data
+
+@app.get("/api/messages/{conversation_id}")
+async def get_messages(conversation_id: str, user=Depends(get_current_user)):
+    """Get messages for a conversation."""
+    conv = await db.conversations.find_one({"id": conversation_id, "user_id": user["id"]})
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    
+    messages = await db.messages.find(
+        {"conversation_id": conversation_id},
+        {"_id": 0}
+    ).sort("created_at", 1).to_list(200)
+    
+    # Mark as read
+    await db.conversations.update_one(
+        {"id": conversation_id},
+        {"$set": {"unread_count": 0}}
+    )
+    
+    return {"messages": messages}
+
+@app.post("/api/messages/send")
+async def send_message(req: SendSMSRequest, user=Depends(get_current_user)):
+    """Send SMS via Sinch."""
+    # Get user's phone numbers
+    user_numbers = await db.phone_numbers.find(
+        {"user_id": user["id"], "is_active": True},
+        {"_id": 0}
+    ).to_list(10)
+    
+    from_number = req.from_number
+    if not from_number and user_numbers:
+        from_number = user_numbers[0]["phone_number"]
+    
+    if not from_number:
+        raise HTTPException(status_code=400, detail="You need to purchase a phone number first to send SMS")
+    
+    # Find or create conversation
+    conv = await db.conversations.find_one({
+        "user_id": user["id"],
+        "recipient_number": req.to_number
+    })
+    
+    if not conv:
+        conv_id = str(uuid.uuid4())
+        conv = {
+            "id": conv_id,
+            "user_id": user["id"],
+            "participants": [user["id"]],
+            "recipient_number": req.to_number,
+            "recipient_name": req.to_number,
+            "last_message": req.message,
+            "unread_count": 0,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        await db.conversations.insert_one(conv)
+    
+    # Send via Sinch SMS API
+    sinch_result = {}
+    sinch_error = None
+    message_status = "sent"
+    
+    try:
+        sms_url = f"https://us.sms.api.sinch.com/xms/v1/{SINCH_SERVICE_PLAN_ID}/batches"
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                sms_url,
+                headers={
+                    "Authorization": f"Bearer {SINCH_SMS_API_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "from": from_number,
+                    "to": [req.to_number],
+                    "body": req.message
+                },
+                timeout=15.0
+            )
+            if resp.status_code in [200, 201]:
+                sinch_result = resp.json()
+                message_status = "sent"
+            else:
+                print(f"Sinch SMS error: {resp.status_code} - {resp.text}")
+                sinch_error = resp.text
+                message_status = "failed"
+    except Exception as e:
+        sinch_error = str(e)
+        message_status = "failed"
+        print(f"SMS send error: {e}")
+    
+    # Save message to DB regardless
+    msg_id = str(uuid.uuid4())
+    message_doc = {
+        "id": msg_id,
+        "conversation_id": conv["id"],
+        "user_id": user["id"],
+        "from_number": from_number,
+        "to_number": req.to_number,
+        "body": req.message,
+        "media_url": req.media_url,
+        "media_type": req.media_type,
+        "direction": "outbound",
+        "status": message_status,
+        "reactions": {},
+        "sinch_batch_id": sinch_result.get("id", ""),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.messages.insert_one(message_doc)
+    
+    # Update conversation
+    await db.conversations.update_one(
+        {"id": conv["id"]},
+        {"$set": {
+            "last_message": req.message,
+            "last_message_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }}
+    )
+    
+    # Notify via WebSocket
+    await manager.send_to_user(user["id"], {
+        "type": "new_message",
+        "message": {k: v for k, v in message_doc.items() if k != "_id"}
+    })
+    
+    if message_status == "failed":
+        return {
+            "success": False,
+            "message": {k: v for k, v in message_doc.items() if k != "_id"},
+            "error": sinch_error
+        }
+    
+    return {
+        "success": True,
+        "message": {k: v for k, v in message_doc.items() if k != "_id"}
+    }
+
+# ─────────────── WEBHOOK (Incoming SMS) ───────────────
+@app.post("/api/webhooks/sms/incoming")
+async def incoming_sms(request_body: dict):
+    """Handle incoming SMS from Sinch."""
+    from_number = request_body.get("from", request_body.get("from_number", ""))
+    to_number = request_body.get("to", request_body.get("to_number", ""))
+    body = request_body.get("body", request_body.get("message", ""))
+    
+    if not from_number or not body:
+        return {"status": "ok"}
+    
+    # Find user who owns the to_number
+    number_doc = await db.phone_numbers.find_one({"phone_number": to_number, "is_active": True})
+    if not number_doc:
+        return {"status": "no_user"}
+    
+    user_id = number_doc["user_id"]
+    
+    # Find or create conversation
+    conv = await db.conversations.find_one({
+        "user_id": user_id,
+        "recipient_number": from_number
+    })
+    
+    if not conv:
+        conv_id = str(uuid.uuid4())
+        conv = {
+            "id": conv_id,
+            "user_id": user_id,
+            "participants": [user_id],
+            "recipient_number": from_number,
+            "recipient_name": from_number,
+            "last_message": body,
+            "unread_count": 1,
+            "created_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        await db.conversations.insert_one(conv)
+    
+    # Save incoming message
+    msg_id = str(uuid.uuid4())
+    message_doc = {
+        "id": msg_id,
+        "conversation_id": conv["id"],
+        "user_id": user_id,
+        "from_number": from_number,
+        "to_number": to_number,
+        "body": body,
+        "direction": "inbound",
+        "status": "received",
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.messages.insert_one(message_doc)
+    
+    # Update conversation
+    await db.conversations.update_one(
+        {"id": conv["id"]},
+        {"$set": {
+            "last_message": body,
+            "last_message_at": datetime.utcnow().isoformat(),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+        "$inc": {"unread_count": 1}}
+    )
+    
+    # Notify via WebSocket
+    await manager.send_to_user(user_id, {
+        "type": "new_message",
+        "message": {k: v for k, v in message_doc.items() if k != "_id"},
+        "conversation_id": conv["id"]
+    })
+    
+    return {"status": "ok"}
+
+# ─────────────── CALLS ROUTES ───────────────
+@app.get("/api/calls/history")
+async def get_call_history(user=Depends(get_current_user)):
+    """Get call history for user."""
+    calls = await db.calls.find(
+        {"user_id": user["id"]},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(100)
+    return {"calls": calls}
+
+@app.post("/api/calls/log")
+async def log_call(call_data: dict, user=Depends(get_current_user)):
+    """Log a call record."""
+    call_id = str(uuid.uuid4())
+    call_doc = {
+        "id": call_id,
+        "user_id": user["id"],
+        "to_number": call_data.get("to_number", ""),
+        "from_number": call_data.get("from_number", ""),
+        "direction": call_data.get("direction", "outbound"),
+        "duration": call_data.get("duration", 0),
+        "status": call_data.get("status", "completed"),
+        "call_type": call_data.get("call_type", "voice"),
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.calls.insert_one(call_doc)
+    # Remove MongoDB _id for JSON serialization
+    call_response = {k: v for k, v in call_doc.items() if k != "_id"}
+    return {"success": True, "call": call_response}
+
+# ─────────────── CONTACTS ROUTES ───────────────
+@app.get("/api/contacts")
+async def get_contacts(user=Depends(get_current_user)):
+    """Get user's contacts."""
+    contacts = await db.contacts.find(
+        {"user_id": user["id"]},
+        {"_id": 0}
+    ).sort("name", 1).to_list(500)
+    return {"contacts": contacts}
+
+@app.post("/api/contacts")
+async def add_contact(req: AddContactRequest, user=Depends(get_current_user)):
+    """Add a new contact."""
+    contact_id = str(uuid.uuid4())
+    contact = {
+        "id": contact_id,
+        "user_id": user["id"],
+        "name": req.name,
+        "phone_number": req.phone_number,
+        "email": req.email or "",
+        "notes": req.notes or "",
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.contacts.insert_one(contact)
+    # Remove MongoDB _id field to avoid serialization issues
+    contact_response = {k: v for k, v in contact.items() if k != "_id"}
+    return {"success": True, "contact": contact_response}
+
+@app.delete("/api/contacts/{contact_id}")
+async def delete_contact(contact_id: str, user=Depends(get_current_user)):
+    """Delete a contact."""
+    result = await db.contacts.delete_one({"id": contact_id, "user_id": user["id"]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return {"success": True}
+
+# ─────────────── VOICEMAIL ───────────────
+@app.get("/api/voicemail")
+async def get_voicemail(user=Depends(get_current_user)):
+    """Get voicemails for user."""
+    voicemails = await db.voicemail.find(
+        {"user_id": user["id"]},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(50)
+    return {"voicemails": voicemails}
+
+# ─────────────── WEBSOCKET ───────────────
+@app.websocket("/api/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    await manager.connect(websocket, user_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            msg = json.loads(data)
+            if msg.get("type") == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, user_id)
+
+# ─────────────── MEDIA UPLOAD ───────────────
+@app.post("/api/messages/upload-media")
+async def upload_media(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user)
+):
+    """Upload media (photo, audio, video) for messages. Returns base64 data URL."""
+    MAX_SIZE = 10 * 1024 * 1024  # 10MB
+    content = await file.read()
+    
+    if len(content) > MAX_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+    
+    media_id = str(uuid.uuid4())
+    b64 = base64.b64encode(content).decode('utf-8')
+    content_type = file.content_type or "application/octet-stream"
+    data_url = f"data:{content_type};base64,{b64}"
+    
+    # Store in DB
+    media_doc = {
+        "id": media_id,
+        "user_id": user["id"],
+        "filename": file.filename,
+        "content_type": content_type,
+        "size": len(content),
+        "data_url": data_url,
+        "created_at": datetime.utcnow().isoformat()
+    }
+    await db.media.insert_one(media_doc)
+    
+    return {
+        "id": media_id,
+        "url": data_url,
+        "content_type": content_type,
+        "filename": file.filename
+    }
+
+# ─────────────── GIF SEARCH ───────────────
+@app.get("/api/gifs/search")
+async def search_gifs(q: str = "trending", limit: int = 20, user=Depends(get_current_user)):
+    """Search GIFs via Klipy API (Tenor replacement)."""
+    if not KLIPY_API_KEY:
+        return {"gifs": [], "error": "Klipy API key not configured"}
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Klipy API endpoint format: https://api.klipy.com/api/v1/{API_KEY}/gifs/search
+            base_url = f"https://api.klipy.com/api/v1/{KLIPY_API_KEY}/gifs"
+            per_page = min(limit, 50)  # Klipy max is 50
+            
+            if q == "trending":
+                url = f"{base_url}/trending?per_page={per_page}&locale=en-US"
+            else:
+                url = f"{base_url}/search?q={q}&per_page={per_page}&locale=en-US"
+            
+            resp = await client.get(url, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                gifs = []
+                
+                # Klipy response structure: {"result": true, "data": {"data": [...], ...}}
+                gif_data = data.get("data", {}).get("data", [])
+                
+                for result in gif_data:
+                    # Klipy GIF structure: {id, slug, title, file: {hd: {gif: {url, width, height}}, sd: {...}}}
+                    hd_gif = result.get("file", {}).get("hd", {}).get("gif", {})
+                    sd_gif = result.get("file", {}).get("sd", {}).get("gif", {})
+                    
+                    # Use HD if available, fallback to SD
+                    gif_url = hd_gif.get("url") or sd_gif.get("url")
+                    
+                    if gif_url:
+                        gifs.append({
+                            "id": result.get("slug", result.get("id")),
+                            "url": gif_url,
+                            "preview": sd_gif.get("url", gif_url),  # Use SD for preview
+                            "width": hd_gif.get("width", sd_gif.get("width", 200)),
+                            "height": hd_gif.get("height", sd_gif.get("height", 200)),
+                            "title": result.get("title", "")
+                        })
+                return {"gifs": gifs}
+            else:
+                return {"gifs": [], "error": f"Klipy API error: {resp.status_code}"}
+    except Exception as e:
+        return {"gifs": [], "error": str(e)}
+
+# ─────────────── TYPING INDICATOR ───────────────
+@app.post("/api/messages/typing")
+async def send_typing(conversation_id: str, user=Depends(get_current_user)):
+    """Broadcast typing indicator to conversation participants."""
+    conv = await db.conversations.find_one({"id": conversation_id})
+    if conv:
+        await manager.send_to_user(conv.get("user_id", ""), {
+            "type": "typing",
+            "conversation_id": conversation_id,
+            "user_id": user["id"],
+            "display_name": user.get("display_name", user.get("username"))
+        })
+    return {"status": "ok"}
+
+# ─────────────── READ RECEIPTS ───────────────
+@app.post("/api/messages/read")
+async def mark_as_read(req: ReadReceiptRequest, user=Depends(get_current_user)):
+    """Mark messages as read."""
+    await db.messages.update_many(
+        {"conversation_id": req.conversation_id, "direction": "inbound", "status": {"$ne": "read"}},
+        {"$set": {"status": "read", "read_at": datetime.utcnow().isoformat()}}
+    )
+    await db.conversations.update_one(
+        {"id": req.conversation_id},
+        {"$set": {"unread_count": 0}}
+    )
+    # Notify sender
+    await manager.send_to_user(user["id"], {
+        "type": "messages_read",
+        "conversation_id": req.conversation_id
+    })
+    return {"status": "ok"}
+
+# ─────────────── MESSAGE REACTION ───────────────
+@app.post("/api/messages/react")
+async def react_to_message(req: ReactToMessageRequest, user=Depends(get_current_user)):
+    """Add emoji reaction to a message."""
+    msg = await db.messages.find_one({"id": req.message_id})
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    
+    reactions = msg.get("reactions", {})
+    if req.emoji not in reactions:
+        reactions[req.emoji] = []
+    
+    if user["id"] in reactions[req.emoji]:
+        reactions[req.emoji].remove(user["id"])
+    else:
+        reactions[req.emoji].append(user["id"])
+    
+    await db.messages.update_one(
+        {"id": req.message_id},
+        {"$set": {"reactions": reactions}}
+    )
+    return {"reactions": reactions}
+
+# ─────────────── HEALTH ───────────────
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "healthy",
+        "app": "RingRing",
+        "version": "1.0.0",
+        "sinch_configured": bool(SINCH_PROJECT_ID and SINCH_ACCESS_KEY_ID),
+        "voice_configured": bool(SINCH_APP_KEY)
+    }
+
+# ─────────────── VOICE TOKEN ───────────────
+@app.post("/api/voice/auth-token")
+async def get_sinch_voice_auth_token(user=Depends(get_current_user)):
+    """Generate Sinch Voice & Video SDK JWT token for authentication"""
+    if not SINCH_APP_KEY or not SINCH_APP_SECRET:
+        raise HTTPException(status_code=503, detail="Voice service not configured")
+    
+    try:
+        token = sinch_voice_jwt.generate_token(user["id"], ttl_seconds=3600)
+        return {
+            "token": token,
+            "app_key": SINCH_APP_KEY,
+            "environment_host": "ocra.api.sinch.com",
+            "user_id": user["id"],
+            "display_name": user.get("display_name", user.get("username", "")),
+            "expires_in": 3600
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Token generation failed: {str(e)}")
+
+@app.get("/api/voice/token")
+async def get_voice_token(user=Depends(get_current_user)):
+    """Get Sinch Voice JWT token for the user to make/receive calls (legacy endpoint)."""
+    # Redirect to new endpoint
+    return await get_sinch_voice_auth_token(user)
+
+@app.get("/api/voice/config")
+async def get_voice_config(user=Depends(get_current_user)):
+    """Get Sinch Voice SDK configuration."""
+    return {
+        "app_key": SINCH_APP_KEY,
+        "user_id": user["id"],
+        "display_name": user.get("display_name", user.get("username", "")),
+        "environment": "production"
+    }
+
+# ─────────────── SINCH VOICE CALLBACKS ───────────────
+class ICERequest(BaseModel):
+    """Incoming Call Event from Sinch"""
+    callid: str
+    cli: str
+    originalcli: Optional[str] = None
+    to: str
+    domain: str
+    timestamp: int
+    custom: Optional[str] = None
+    callheaders: Optional[dict] = None
+    mxp: Optional[dict] = None
+
+class ACERequest(BaseModel):
+    """Answered Call Event from Sinch"""
+    callid: str
+    callResourceUrl: str
+    cli: str
+    to: str
+    domain: str
+    timestamp: int
+    amd: Optional[dict] = None
+
+class DICERequest(BaseModel):
+    """Disconnect Call Event from Sinch"""
+    callid: str
+    callResourceUrl: str
+    reason: str
+    timestamp: int
+    result: str
+
+@app.post("/api/sinch/ice")
+async def handle_incoming_call_event(request: ICERequest):
+    """Handle Incoming Call Event (ICE) callback from Sinch"""
+    try:
+        print(f"[ICE] Call: {request.callid}, From: {request.cli}, To: {request.to}, Domain: {request.domain}")
+        
+        if request.domain == "mxp":
+            # App-to-app call - route to user
+            target_user_id = request.to.replace("+", "")  # Extract user ID from number
+            if request.mxp:
+                target_user_id = request.mxp.get("userid", target_user_id)
+            
+            action = {
+                "name": "connectMxp",
+                "destination": {
+                    "type": "username",
+                    "endpoint": target_user_id
+                }
+            }
+        elif request.domain == "pstn":
+            # PSTN call - route through conference
+            action = {
+                "name": "connectConf",
+                "destination": {
+                    "conferenceId": f"conf-{request.callid}"
+                }
+            }
+        else:
+            action = {"name": "hangup"}
+        
+        return {"action": action, "instructions": []}
+    except Exception as e:
+        print(f"[ICE] Error: {e}")
+        return {"action": {"name": "hangup"}, "instructions": []}
+
+@app.post("/api/sinch/ace")
+async def handle_answered_call_event(request: ACERequest):
+    """Handle Answered Call Event (ACE) callback from Sinch"""
+    try:
+        print(f"[ACE] Call answered: {request.callid}, Domain: {request.domain}")
+        
+        # Log the answered call
+        await db.calls.update_one(
+            {"sinch_call_id": request.callid},
+            {"$set": {"status": "answered", "answered_at": datetime.now(timezone.utc).isoformat()}},
+            upsert=False
+        )
+        
+        return {"action": {"name": "continue"}, "instructions": []}
+    except Exception as e:
+        print(f"[ACE] Error: {e}")
+        return {"action": {"name": "continue"}}
+
+@app.post("/api/sinch/dice")
+async def handle_disconnect_call_event(request: DICERequest):
+    """Handle Disconnect Call Event (DiCE) callback from Sinch"""
+    try:
+        print(f"[DiCE] Call ended: {request.callid}, Reason: {request.reason}, Result: {request.result}")
+        
+        # Update call record
+        await db.calls.update_one(
+            {"sinch_call_id": request.callid},
+            {"$set": {
+                "status": "completed",
+                "end_reason": request.reason,
+                "result": request.result,
+                "ended_at": datetime.now(timezone.utc).isoformat()
+            }},
+            upsert=False
+        )
+        
+        return {}
+    except Exception as e:
+        print(f"[DiCE] Error: {e}")
+        return {}
+
+# ─────────────── CALL HISTORY  ───────────────
+@app.get("/api/calls/recent")
+async def get_recent_calls(user=Depends(get_current_user)):
+    """Get recent calls for dashboard."""
+    calls = await db.calls.find(
+        {"user_id": user["id"]},
+        {"_id": 0}
+    ).sort("created_at", -1).to_list(20)
+    return {"calls": calls}
